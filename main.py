@@ -1,207 +1,142 @@
-# from fastapi import FastAPI
-# from pydantic import BaseModel
-# import sqlite3
-# import random
-
-# DB_NAME = "bookings.db"
-
-# app = FastAPI(title="Coolie No.1 API")
-
-# # Mock coolies
-# coolies = [
-#     {"name": "Raju", "rating": 4.5, "station": "Gwalior"},
-#     {"name": "Sita", "rating": 4.2, "station": "Jaipur"},
-#     {"name": "Amit", "rating": 4.8, "station": "Udaipur"},
-#     {"name": "Pooja", "rating": 4.7, "station": "Delhi"},
-#     {"name": "Rahul", "rating": 4.6, "station": "Mumbai"},
-# ]
-
-# # Translation dictionaries
-# translations = {
-#     "Hindi": {"hello":"नमस्ते"},
-#     "Marathi": {"hello":"नमस्कार"},
-#     "Tamil": {"hello":"வணக்கம்"},
-#     "Bengali": {"hello":"নমস্কার"},
-#     "Gujarati": {"hello":"નમસ્તે"},
-# }
-
-# # Pydantic models
-# class Booking(BaseModel):
-#     passenger: str
-#     city: str
-#     arrival: str
-#     luggage_weight: float
-#     service: str
-
-# class Translation(BaseModel):
-#     text: str
-#     language: str
-
-# # -------------------
-# # API Endpoints
-# # -------------------
-
-# @app.post("/book")
-# def book_service(booking: Booking):
-#     # assign helper
-#     available = [c for c in coolies if c["station"]==booking.city]
-#     if not available:
-#         assigned = random.choice(coolies)
-#         fallback_msg = f"No local helper at {booking.city}, assigned {assigned['name']}"
-#     else:
-#         assigned = random.choice(available)
-#         fallback_msg = ""
-
-#     fare = 30 + booking.luggage_weight*2.5
-
-#     # Save to SQLite
-#     conn = sqlite3.connect(DB_NAME)
-#     cursor = conn.cursor()
-#     cursor.execute("""
-#         INSERT INTO bookings (passenger, city, arrival, luggage_weight, service, assigned_helper, fare)
-#         VALUES (?, ?, ?, ?, ?, ?, ?)
-#     """, (booking.passenger, booking.city, booking.arrival, booking.luggage_weight, booking.service, assigned["name"], fare))
-#     conn.commit()
-#     conn.close()
-
-#     return {"message": "Booking confirmed", "assigned_helper": assigned["name"], "fare": fare, "fallback": fallback_msg}
-
-
-# @app.get("/bookings")
-# def get_bookings():
-#     conn = sqlite3.connect(DB_NAME)
-#     cursor = conn.cursor()
-#     cursor.execute("SELECT * FROM bookings")
-#     data = cursor.fetchall()
-#     conn.close()
-#     return {"bookings": data}
-
-
-# @app.post("/translate")
-# def translate(trans: Translation):
-#     text = trans.text.lower()
-#     language = trans.language
-#     dictionary = translations.get(language, {})
-#     translated = " ".join([dictionary.get(word, word) for word in text.split()])
-#     return {"translated_text": translated}
-
-
-# main.py
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import sqlite3
-import random
-import os
+from datetime import datetime
+from deep_translator import GoogleTranslator
 
-# -------------------------------
-# Database setup
-# -------------------------------
-DB_NAME = "bookings.db"
+DB_FILE = "bookings.db"
 
+app = FastAPI(title="Coolie No.1 Production")
+
+# ---------------------------
+# CORS
+# ---------------------------
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # change in production
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# ---------------------------
+# Booking Model
+# ---------------------------
+class Booking(BaseModel):
+    name: str
+    country: str = "India"
+    state: str
+    city: str
+    luggage_weight: float
+    arrival_time: str
+    service_type: str
+    # Add more fields here anytime, defaults ensure old rows are safe
+
+# Translation Model
+class TranslateRequest(BaseModel):
+    text: str
+    source: str = "auto"
+    target: str
+
+# ---------------------------
+# Dynamic DB Initialization with default values
+# ---------------------------
 def init_db():
-    """Initialize the SQLite database and bookings table"""
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute("""
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+
+    # Minimal table creation
+    c.execute('''
         CREATE TABLE IF NOT EXISTS bookings (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            passenger TEXT,
-            city TEXT,
-            arrival TEXT,
-            luggage_weight REAL,
-            service TEXT,
-            assigned_helper TEXT,
-            fare REAL
+            id INTEGER PRIMARY KEY AUTOINCREMENT
         )
-    """)
+    ''')
+
+    # Existing columns in DB
+    c.execute("PRAGMA table_info(bookings)")
+    existing_cols = [col[1] for col in c.fetchall()]
+
+    # Booking fields from Pydantic model
+    booking_fields = Booking.__annotations__  # dict of field_name: type
+    type_mapping = {str: "TEXT", float: "REAL", int: "INTEGER", bool: "INTEGER"}
+
+    for field_name, field_type in booking_fields.items():
+        col_type = type_mapping.get(field_type, "TEXT")
+        if field_name not in existing_cols:
+            # Add column
+            c.execute(f"ALTER TABLE bookings ADD COLUMN {field_name} {col_type}")
+            # Set default value for existing rows
+            default_value = getattr(Booking, field_name, None)
+            if default_value is not None:
+                c.execute(f"UPDATE bookings SET {field_name} = ?", (default_value,))
+
+    # Ensure helper, fare, timestamp exist
+    for extra in ["helper", "fare", "timestamp"]:
+        if extra not in existing_cols:
+            c.execute(f"ALTER TABLE bookings ADD COLUMN {extra} TEXT")
+            c.execute(f"UPDATE bookings SET {extra} = ''")  # empty default
+
     conn.commit()
     conn.close()
-    print(f"Database '{DB_NAME}' initialized successfully.")
 
-# Initialize DB before starting FastAPI app
 init_db()
 
-# -------------------------------
-# FastAPI app setup
-# -------------------------------
-app = FastAPI(title="Coolie No.1 API")
-
-# -------------------------------
-# Mock data
-# -------------------------------
-coolies = [
-    {"name": "Raju", "rating": 4.5, "station": "Gwalior"},
-    {"name": "Sita", "rating": 4.2, "station": "Jaipur"},
-    {"name": "Amit", "rating": 4.8, "station": "Udaipur"},
-    {"name": "Pooja", "rating": 4.7, "station": "Delhi"},
-    {"name": "Rahul", "rating": 4.6, "station": "Mumbai"},
-]
-
-translations = {
-    "Hindi": {"hello": "नमस्ते"},
-    "Marathi": {"hello": "नमस्कार"},
-    "Tamil": {"hello": "வணக்கம்"},
-    "Bengali": {"hello": "নমস্কার"},
-    "Gujarati": {"hello": "નમસ્તે"},
-}
-
-# -------------------------------
-# Pydantic models
-# -------------------------------
-class Booking(BaseModel):
-    passenger: str
-    city: str
-    arrival: str
-    luggage_weight: float
-    service: str
-
-class Translation(BaseModel):
-    text: str
-    language: str
-
-# -------------------------------
-# API Endpoints
-# -------------------------------
+# ---------------------------
+# Booking Endpoint
+# ---------------------------
 @app.post("/book")
-def book_service(booking: Booking):
-    # Assign helper
-    available = [c for c in coolies if c["station"] == booking.city]
-    if not available:
-        assigned = random.choice(coolies)
-        fallback_msg = f"No local helper at {booking.city}, assigned {assigned['name']}"
-    else:
-        assigned = random.choice(available)
-        fallback_msg = ""
+def book_trolley(data: Booking):
+    fare = 30 + data.luggage_weight * 2.5
+    helper = f"Assigned Helper {data.city[:2].upper()}"
+    timestamp = datetime.now().isoformat()
 
-    fare = 30 + booking.luggage_weight * 2.5
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
 
-    # Save booking to DB
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute("""
-        INSERT INTO bookings 
-        (passenger, city, arrival, luggage_weight, service, assigned_helper, fare)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-    """, (booking.passenger, booking.city, booking.arrival, booking.luggage_weight,
-          booking.service, assigned["name"], fare))
+    fields = list(data.dict().keys()) + ["helper", "fare", "timestamp"]
+    values = list(data.dict().values()) + [helper, fare, timestamp]
+
+    placeholders = ", ".join(["?"] * len(fields))
+    columns = ", ".join(fields)
+
+    c.execute(f"INSERT INTO bookings ({columns}) VALUES ({placeholders})", values)
     conn.commit()
     conn.close()
 
-    return {"message": "Booking confirmed", "assigned_helper": assigned["name"], "fare": fare, "fallback": fallback_msg}
+    return {
+        "status": "success",
+        **data.dict(),
+        "helper": helper,
+        "fare": fare,
+        "timestamp": timestamp
+    }
 
+# ---------------------------   
+# Fetch All Bookings
+# ---------------------------
 @app.get("/bookings")
 def get_bookings():
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute("SELECT * FROM bookings")
-    data = cursor.fetchall()
-    conn.close()
-    return {"bookings": data}
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("PRAGMA table_info(bookings)")
+    cols = [col[1] for col in c.fetchall()]
 
+    c.execute("SELECT * FROM bookings ORDER BY id DESC")
+    rows = c.fetchall()
+    conn.close()
+
+    return {
+        "bookings": [dict(zip(cols, r)) for r in rows]
+    }
+
+# ---------------------------
+# Translation Endpoint
+# ---------------------------
 @app.post("/translate")
-def translate(trans: Translation):
-    text = trans.text.lower()
-    language = trans.language
-    dictionary = translations.get(language, {})
-    translated = " ".join([dictionary.get(word, word) for word in text.split()])
-    return {"translated_text": translated}
+def translate_text(req: TranslateRequest):
+    try:
+        translated = GoogleTranslator(source=req.source, target=req.target).translate(req.text)
+        return {"translatedText": translated}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
